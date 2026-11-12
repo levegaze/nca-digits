@@ -9,6 +9,7 @@ ITERS   ?= 8000
 DIGIT   ?= 3
 WEIGHTS ?= weights.bin
 RESUME  ?=
+TRIALS  ?= 20
 RESUME_ARG := $(if $(RESUME),resume,)
 
 .DEFAULT_GOAL := help
@@ -50,8 +51,8 @@ overfit-solid: ## Solid-target overfit (loop-correctness discriminator)
 gen: ## Grow one digit and render: make gen DIGIT=7 WEIGHTS=weights.bin
 	$(RUN) gen $(DIGIT) $(WEIGHTS)
 
-eval: ## Score a checkpoint: make eval WEIGHTS=weights_robust.bin
-	$(RUN) eval $(WEIGHTS)
+eval: ## Score a checkpoint over TRIALS rollouts/digit: make eval WEIGHTS=weights_robust.bin TRIALS=50
+	$(RUN) eval $(WEIGHTS) $(TRIALS)
 
 viz: ## Visualizer window (macroquad)
 	$(CARGO) run --release --features viz --bin viz

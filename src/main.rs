@@ -53,8 +53,12 @@ fn main() {
             let path = args.get(3).map(String::as_str).unwrap_or("weights.bin");
             generate(digit, path);
         }
-        // `eval [weights_path]` — per-digit loss, accuracy, self-repair
-        "eval" => eval(args.get(2).map(String::as_str).unwrap_or("weights.bin")),
+        // `eval [weights_path] [trials]` — per-digit loss, accuracy, self-repair
+        "eval" => {
+            let path = args.get(2).map(String::as_str).unwrap_or("weights.bin");
+            let trials: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20);
+            eval(path, trials);
+        }
         other => eprintln!(
             "unknown command: {other} (use `check` | `train [steps] [resume]` | `overfit [iters] [digit]` | `gen [digit]` | `eval`)"
         ),
@@ -406,51 +410,91 @@ fn damage(g: &Grid, frac: f32, rng: &mut StdRng) -> Grid {
     d
 }
 
-// Metrics: per-digit recon MSE, classification accuracy, self-repair.
-fn eval(path: &str) {
-    let Some(net) = load_or_warn(path) else { return };
-    println!("eval {path}");
-    let mut rng = StdRng::seed_from_u64(7);
+// Index of the target the grid is closest to (nearest-template classifier).
+fn classify(g: &Grid, targets: &[ndarray::Array3<f32>]) -> usize {
+    let mut best = (0usize, f32::INFINITY);
+    for (t, target) in targets.iter().enumerate() {
+        let l = mse_loss(g, target);
+        if l < best.1 {
+            best = (t, l);
+        }
+    }
+    best.0
+}
 
-    let grids: Vec<Grid> = (0..N_DIGITS).map(|d| grow(&net, d, &mut rng)).collect();
+fn mean_std(xs: &[f32]) -> (f32, f32) {
+    let n = xs.len() as f32;
+    let mean = xs.iter().sum::<f32>() / n;
+    let var = xs.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+    (mean, var.sqrt())
+}
+
+// One eval rollout: grow, classify, damage 30%, regrow 20 steps.
+struct Trial {
+    grown: f32,
+    correct: bool,
+    damaged: f32,
+    repaired: f32,
+    healed: bool,
+}
+
+// A repair counts only if loss returns to within this factor of the pre-damage loss.
+const REPAIR_TOL: f32 = 1.2;
+const REPAIR_STEPS: usize = 20;
+
+// Metrics over `trials` stochastic rollouts per digit: recon MSE (mean ± std),
+// classification accuracy, and self-repair rate.
+fn eval(path: &str, trials: usize) {
+    let Some(net) = load_or_warn(path) else { return };
+    let trials = trials.max(1);
+    println!("eval {path}  ({trials} rollouts/digit, repair = loss <= {REPAIR_TOL}x grown after {REPAIR_STEPS} steps)");
     let targets: Vec<_> = (0..N_DIGITS).map(target_rgba).collect();
 
-    println!("digit | recon_loss | predicted");
-    let mut sum_loss = 0.0f32;
-    let mut correct = 0;
-    for d in 0..N_DIGITS {
-        let loss = mse_loss(&grids[d], &targets[d]);
-        // classify: which target is the grown image closest to?
-        let mut best = (0usize, f32::INFINITY);
-        for t in 0..N_DIGITS {
-            let l = mse_loss(&grids[d], &targets[t]);
-            if l < best.1 {
-                best = (t, l);
-            }
-        }
-        if best.0 == d {
-            correct += 1;
-        }
-        println!(
-            "  {d}   |   {loss:.4}   |   {} {}",
-            best.0,
-            if best.0 == d { "ok" } else { "MISS" }
-        );
-        sum_loss += loss;
-    }
-    println!(
-        "avg recon loss {:.4}  |  accuracy {correct}/{N_DIGITS}",
-        sum_loss / N_DIGITS as f32
-    );
+    let results: Vec<Vec<Trial>> = (0..N_DIGITS)
+        .map(|d| {
+            (0..trials)
+                .into_par_iter()
+                .map(|t| {
+                    let mut rng = StdRng::seed_from_u64(7 + (d * 1_000 + t) as u64);
+                    let g = grow(&net, d, &mut rng);
+                    let grown = mse_loss(&g, &targets[d]);
+                    let correct = classify(&g, &targets) == d;
+                    let dmg = damage(&g, 0.30, &mut rng);
+                    let damaged = mse_loss(&dmg, &targets[d]);
+                    let rep = train_rollout(&net, &dmg, REPAIR_STEPS, 0, d, &mut rng).0;
+                    let repaired = mse_loss(&rep, &targets[d]);
+                    let healed = repaired <= grown * REPAIR_TOL;
+                    Trial { grown, correct, damaged, repaired, healed }
+                })
+                .collect()
+        })
+        .collect();
 
-    println!("\nself-repair (erase 30%, +20 steps):");
-    for d in 0..N_DIGITS {
-        let grown = mse_loss(&grids[d], &targets[d]);
-        let damaged = damage(&grids[d], 0.30, &mut rng);
-        let dmg = mse_loss(&damaged, &targets[d]);
-        let repaired = train_rollout(&net, &damaged, 20, 0, d, &mut rng).0;
-        let after = mse_loss(&repaired, &targets[d]);
-        let verdict = if after < dmg { "recovered" } else { "no" };
-        println!("  {d}: grown {grown:.3} -> damaged {dmg:.3} -> repaired {after:.3}  [{verdict}]");
+    println!("digit | recon_loss (mean±std) | accuracy | damaged -> repaired | healed");
+    let mut all_loss = Vec::with_capacity(N_DIGITS * trials);
+    let (mut correct, mut healed) = (0usize, 0usize);
+    let (mut perfect_acc, mut perfect_heal) = (0usize, 0usize);
+    for (d, ts) in results.iter().enumerate() {
+        let losses: Vec<f32> = ts.iter().map(|t| t.grown).collect();
+        let (m, s) = mean_std(&losses);
+        let c = ts.iter().filter(|t| t.correct).count();
+        let h = ts.iter().filter(|t| t.healed).count();
+        let dmg = ts.iter().map(|t| t.damaged).sum::<f32>() / trials as f32;
+        let rep = ts.iter().map(|t| t.repaired).sum::<f32>() / trials as f32;
+        println!(
+            "  {d}   |   {m:.4} ± {s:.4}      |  {c:3}/{trials:<3} |  {dmg:.3} -> {rep:.3}     | {h:3}/{trials}"
+        );
+        all_loss.extend(losses);
+        correct += c;
+        healed += h;
+        perfect_acc += (c == trials) as usize;
+        perfect_heal += (h == trials) as usize;
     }
+    let total = N_DIGITS * trials;
+    let (m, s) = mean_std(&all_loss);
+    println!(
+        "\navg recon loss {m:.4} ± {s:.4}\naccuracy    {:.1}%  ({correct}/{total})  |  digits always correct {perfect_acc}/{N_DIGITS}\nself-repair {:.1}%  ({healed}/{total})  |  digits always healed  {perfect_heal}/{N_DIGITS}",
+        100.0 * correct as f32 / total as f32,
+        100.0 * healed as f32 / total as f32,
+    );
 }

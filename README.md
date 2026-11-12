@@ -45,7 +45,7 @@ All modes checkpoint every 1000 steps and support `RESUME=1`.
 | `train-robust [steps] [resume]` | full BPTT + pool + damage aug |
 | `overfit-all [iters]` | sharpest accuracy, no pool |
 | `gen [digit] [weights]` | grow a digit, print ASCII |
-| `eval [weights]` | loss / accuracy / self-repair |
+| `eval [weights] [trials]` | loss / accuracy / self-repair over N rollouts per digit (default 20) |
 
 ---
 
