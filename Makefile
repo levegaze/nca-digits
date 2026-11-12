@@ -22,7 +22,7 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 	@echo ""
-	@echo "vars: STEPS=$(STEPS) ITERS=$(ITERS) DIGIT=$(DIGIT) WEIGHTS=$(WEIGHTS) RESUME=$(RESUME)"
+	@echo "vars: STEPS=$(STEPS) ITERS=$(ITERS) DIGIT=$(DIGIT) WEIGHTS=$(WEIGHTS) RESUME=$(RESUME) TRIALS=$(TRIALS)"
 
 build: ## Compile (release)
 	$(CARGO) build --release

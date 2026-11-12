@@ -60,7 +60,7 @@ fn main() {
             eval(path, trials);
         }
         other => eprintln!(
-            "unknown command: {other} (use `check` | `train [steps] [resume]` | `overfit [iters] [digit]` | `gen [digit]` | `eval`)"
+            "unknown command: {other} (use `check` | `train [steps] [resume]` | `train-robust [steps] [resume]` | `overfit-all [iters]` | `overfit [iters] [digit]` | `gen [digit] [weights]` | `eval [weights] [trials]`)"
         ),
     }
 }
@@ -438,8 +438,12 @@ struct Trial {
     healed: bool,
 }
 
-// A repair counts only if loss returns to within this factor of the pre-damage loss.
+// A repair counts only if the regrown grid still classifies as the right digit
+// and its loss is back within REPAIR_TOL x the pre-damage loss. REPAIR_SLACK is
+// an absolute allowance so a near-zero pre-damage loss doesn't make the relative
+// bound tighter than the rollout-to-rollout noise.
 const REPAIR_TOL: f32 = 1.2;
+const REPAIR_SLACK: f32 = 0.005;
 const REPAIR_STEPS: usize = 20;
 
 // Metrics over `trials` stochastic rollouts per digit: recon MSE (mean ± std),
@@ -447,7 +451,9 @@ const REPAIR_STEPS: usize = 20;
 fn eval(path: &str, trials: usize) {
     let Some(net) = load_or_warn(path) else { return };
     let trials = trials.max(1);
-    println!("eval {path}  ({trials} rollouts/digit, repair = loss <= {REPAIR_TOL}x grown after {REPAIR_STEPS} steps)");
+    println!(
+        "eval {path}  ({trials} rollouts/digit, healed = right digit and loss <= {REPAIR_TOL}x grown + {REPAIR_SLACK} after {REPAIR_STEPS} steps)"
+    );
     let targets: Vec<_> = (0..N_DIGITS).map(target_rgba).collect();
 
     let results: Vec<Vec<Trial>> = (0..N_DIGITS)
@@ -455,7 +461,8 @@ fn eval(path: &str, trials: usize) {
             (0..trials)
                 .into_par_iter()
                 .map(|t| {
-                    let mut rng = StdRng::seed_from_u64(7 + (d * 1_000 + t) as u64);
+                    // digit in the high bits: no (digit, trial) pair shares a seed
+                    let mut rng = StdRng::seed_from_u64(((d as u64) << 32) | t as u64);
                     let g = grow(&net, d, &mut rng);
                     let grown = mse_loss(&g, &targets[d]);
                     let correct = classify(&g, &targets) == d;
@@ -463,7 +470,8 @@ fn eval(path: &str, trials: usize) {
                     let damaged = mse_loss(&dmg, &targets[d]);
                     let rep = train_rollout(&net, &dmg, REPAIR_STEPS, 0, d, &mut rng).0;
                     let repaired = mse_loss(&rep, &targets[d]);
-                    let healed = repaired <= grown * REPAIR_TOL;
+                    let healed = classify(&rep, &targets) == d
+                        && repaired <= grown * REPAIR_TOL + REPAIR_SLACK;
                     Trial { grown, correct, damaged, repaired, healed }
                 })
                 .collect()
