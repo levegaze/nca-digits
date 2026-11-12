@@ -1,12 +1,13 @@
 // Forward-with-cache, MSE loss, truncated BPTT.
 // One step: new = life * (grid + mask*delta), then seed re-injection.
+// The network is applied to all H*W cells at once (see `update`).
 
 use crate::constants::*;
 use crate::digits::seed_cells;
 use crate::grid::{alive_mask, new_grid, Grid};
 use crate::network::{Grads, NCANet};
-use crate::perception::{perceive, SOBEL_X, SOBEL_Y};
-use ndarray::{Array2, Array3};
+use crate::perception::{perceive_all, SOBEL_X, SOBEL_Y};
+use ndarray::{Array2, Array3, Axis, Zip};
 use rand::Rng;
 
 // Pin each seed cell's alpha + one-hot (a permanent live source; stop-grad).
@@ -33,48 +34,58 @@ pub fn random_mask<R: Rng>(rng: &mut R) -> Vec<bool> {
 
 pub struct StepCache {
     pub masks: Vec<bool>,
-    pub perceptions: Vec<[f32; PERC]>,
-    pub pre_relu: Vec<[f32; HIDDEN]>,
-    pub life: Array2<f32>, // frozen alive gate
+    pub perceptions: Array2<f32>, // [H*W, PERC]
+    pub hidden: Array2<f32>,      // [H*W, HIDDEN], post-ReLU
+    pub life: Array2<f32>,        // frozen alive gate
 }
 
-pub fn step_cache(net: &NCANet, grid: &Grid, masks: &[bool], digit: usize) -> (Grid, StepCache) {
+fn is_cond(ch: usize) -> bool {
+    (COND_LO..COND_HI).contains(&ch)
+}
+
+// grid + mask * delta with the conditioning channels frozen, before the alive
+// gate. The network runs once over all cells (two matrix products). Also returns
+// the perception and hidden matrices, which backward needs.
+fn update(net: &NCANet, grid: &Grid, masks: &[bool]) -> (Grid, Array2<f32>, Array2<f32>) {
+    let perceptions = perceive_all(grid);
+    let (hidden, delta) = net.forward_batch(&perceptions);
     let mut new = grid.clone();
-    let mut perceptions = vec![[0.0f32; PERC]; H * W];
-    let mut pre_relu = vec![[0.0f32; HIDDEN]; H * W];
-    for r in 0..H {
-        for c in 0..W {
-            let idx = r * W + c;
-            let p = perceive(grid, r, c);
-            let (pre, mut delta) = net.forward(&p);
-            perceptions[idx] = p;
-            pre_relu[idx] = pre;
-            for ch in COND_LO..COND_HI {
-                delta[ch] = 0.0; // freeze conditioning
-            }
-            if masks[idx] {
-                for ch in 0..C {
-                    new[[r, c, ch]] += delta[ch];
-                }
+    for idx in 0..H * W {
+        if !masks[idx] {
+            continue;
+        }
+        let (r, c) = (idx / W, idx % W);
+        for ch in 0..C {
+            if !is_cond(ch) {
+                new[[r, c, ch]] += delta[[idx, ch]];
             }
         }
     }
-    let life = alive_mask(&new);
+    (new, perceptions, hidden)
+}
+
+fn apply_life(g: &mut Grid, life: &Array2<f32>) {
     for r in 0..H {
         for c in 0..W {
             let l = life[[r, c]];
             for ch in 0..C {
-                new[[r, c, ch]] *= l;
+                g[[r, c, ch]] *= l;
             }
         }
     }
+}
+
+pub fn step_cache(net: &NCANet, grid: &Grid, masks: &[bool], digit: usize) -> (Grid, StepCache) {
+    let (mut new, perceptions, hidden) = update(net, grid, masks);
+    let life = alive_mask(&new);
+    apply_life(&mut new, &life);
     reinject_seed(&mut new, digit);
     (
         new,
         StepCache {
             masks: masks.to_vec(),
             perceptions,
-            pre_relu,
+            hidden,
             life,
         },
     )
@@ -82,31 +93,9 @@ pub fn step_cache(net: &NCANet, grid: &Grid, masks: &[bool], digit: usize) -> (G
 
 // Forward step without caching.
 pub fn step_only(net: &NCANet, grid: &Grid, masks: &[bool], digit: usize) -> Grid {
-    let mut new = grid.clone();
-    for r in 0..H {
-        for c in 0..W {
-            let idx = r * W + c;
-            let p = perceive(grid, r, c);
-            let (_, mut delta) = net.forward(&p);
-            for ch in COND_LO..COND_HI {
-                delta[ch] = 0.0;
-            }
-            if masks[idx] {
-                for ch in 0..C {
-                    new[[r, c, ch]] += delta[ch];
-                }
-            }
-        }
-    }
+    let (mut new, _, _) = update(net, grid, masks);
     let life = alive_mask(&new);
-    for r in 0..H {
-        for c in 0..W {
-            let l = life[[r, c]];
-            for ch in 0..C {
-                new[[r, c, ch]] *= l;
-            }
-        }
-    }
+    apply_life(&mut new, &life);
     reinject_seed(&mut new, digit);
     new
 }
@@ -144,30 +133,8 @@ pub fn step_only_frozen(
     life: &Array2<f32>,
     digit: usize,
 ) -> Grid {
-    let mut new = grid.clone();
-    for r in 0..H {
-        for c in 0..W {
-            let idx = r * W + c;
-            let p = perceive(grid, r, c);
-            let (_, mut delta) = net.forward(&p);
-            for ch in COND_LO..COND_HI {
-                delta[ch] = 0.0;
-            }
-            if masks[idx] {
-                for ch in 0..C {
-                    new[[r, c, ch]] += delta[ch];
-                }
-            }
-        }
-    }
-    for r in 0..H {
-        for c in 0..W {
-            let l = life[[r, c]];
-            for ch in 0..C {
-                new[[r, c, ch]] *= l;
-            }
-        }
-    }
+    let (mut new, _, _) = update(net, grid, masks);
+    apply_life(&mut new, life);
     reinject_seed(&mut new, digit);
     new
 }
@@ -254,6 +221,7 @@ pub fn mse_grad(grid: &Grid, target: &Array3<f32>) -> Grid {
 }
 
 // Backprop one step: accumulate weight grads, return d_in (grad wrt the input).
+// Mirrors `update`: the two layers are backpropagated for all cells at once.
 pub fn backward_step(
     net: &NCANet,
     cache: &StepCache,
@@ -262,80 +230,60 @@ pub fn backward_step(
     seed: &[bool],
 ) -> Grid {
     let mut d_in = new_grid();
-    for r in 0..H {
-        for c in 0..W {
-            let idx = r * W + c;
-            let l = cache.life[[r, c]]; // frozen alive gate
-            let mut d_new = [0.0f32; C];
-            for ch in 0..C {
-                d_new[ch] = d_out[[r, c, ch]] * l;
-            }
+    // grad wrt the network's delta, one row per cell; zero where the cell did
+    // not fire and on the frozen conditioning channels
+    let mut d_delta = Array2::<f32>::zeros((H * W, C));
+    for idx in 0..H * W {
+        let (r, c) = (idx / W, idx % W);
+        let l = cache.life[[r, c]]; // frozen alive gate
+        for ch in 0..C {
             // seed cells: alpha + one-hot are pinned -> zero upstream grad
-            if seed[idx] {
-                d_new[ALPHA] = 0.0;
-                for ch in COND_LO..COND_HI {
-                    d_new[ch] = 0.0;
+            let pinned = seed[idx] && (ch == ALPHA || is_cond(ch));
+            let d = if pinned { 0.0 } else { d_out[[r, c, ch]] * l };
+            d_in[[r, c, ch]] = d; // residual passthrough
+            if cache.masks[idx] && !is_cond(ch) {
+                d_delta[[idx, ch]] = d;
+            }
+        }
+    }
+    // layer2
+    grads.b2 += &d_delta.sum_axis(Axis(0));
+    grads.w2 += &d_delta.t().dot(&cache.hidden);
+    // ReLU
+    let mut d_pre = d_delta.dot(&net.w2);
+    Zip::from(&mut d_pre).and(&cache.hidden).for_each(|d, &h| {
+        if h <= 0.0 {
+            *d = 0.0;
+        }
+    });
+    // layer1
+    grads.b1 += &d_pre.sum_axis(Axis(0));
+    grads.w1 += &d_pre.t().dot(&cache.perceptions);
+    let d_perc = d_pre.dot(&net.w1);
+    // scatter d_perc back through perception
+    for idx in 0..H * W {
+        if !cache.masks[idx] {
+            continue; // row is all zero
+        }
+        let (r, c) = (idx / W, idx % W);
+        // identity -> self
+        for ch in 0..C {
+            d_in[[r, c, ch]] += d_perc[[idx, ch]];
+        }
+        // sobel -> 3x3 neighbors
+        for ki in 0..3 {
+            for kj in 0..3 {
+                let nr = r as i32 + ki as i32 - 1;
+                let nc = c as i32 + kj as i32 - 1;
+                if nr < 0 || nr >= H as i32 || nc < 0 || nc >= W as i32 {
+                    continue;
                 }
-            }
-            // residual passthrough
-            for ch in 0..C {
-                d_in[[r, c, ch]] += d_new[ch];
-            }
-            if !cache.masks[idx] {
-                continue;
-            }
-            let mut d_delta = d_new;
-            for ch in COND_LO..COND_HI {
-                d_delta[ch] = 0.0; // conditioning frozen
-            }
-            let pre = &cache.pre_relu[idx];
-            // layer2
-            let mut dh = [0.0f32; HIDDEN];
-            for k in 0..C {
-                let dd = d_delta[k];
-                grads.b2[k] += dd;
-                let w2row = net.w2.row(k);
-                for i in 0..HIDDEN {
-                    let h = if pre[i] > 0.0 { pre[i] } else { 0.0 };
-                    grads.w2[[k, i]] += dd * h;
-                    dh[i] += w2row[i] * dd;
-                }
-            }
-            // ReLU
-            let mut d_pre = [0.0f32; HIDDEN];
-            for i in 0..HIDDEN {
-                d_pre[i] = if pre[i] > 0.0 { dh[i] } else { 0.0 };
-            }
-            // layer1
-            let p = &cache.perceptions[idx];
-            let mut d_perc = [0.0f32; PERC];
-            for i in 0..HIDDEN {
-                let dp = d_pre[i];
-                grads.b1[i] += dp;
-                let w1row = net.w1.row(i);
-                for j in 0..PERC {
-                    grads.w1[[i, j]] += dp * p[j];
-                    d_perc[j] += w1row[j] * dp;
-                }
-            }
-            // scatter d_perc back through perception: identity -> self
-            for ch in 0..C {
-                d_in[[r, c, ch]] += d_perc[ch];
-            }
-            // sobel -> 3x3 neighbors
-            for ki in 0..3 {
-                for kj in 0..3 {
-                    let nr = r as i32 + ki as i32 - 1;
-                    let nc = c as i32 + kj as i32 - 1;
-                    if nr < 0 || nr >= H as i32 || nc < 0 || nc >= W as i32 {
-                        continue;
-                    }
-                    let (nr, nc) = (nr as usize, nc as usize);
-                    let wx = SOBEL_X[ki][kj];
-                    let wy = SOBEL_Y[ki][kj];
-                    for ch in 0..C {
-                        d_in[[nr, nc, ch]] += d_perc[C + ch] * wx + d_perc[2 * C + ch] * wy;
-                    }
+                let (nr, nc) = (nr as usize, nc as usize);
+                let wx = SOBEL_X[ki][kj];
+                let wy = SOBEL_Y[ki][kj];
+                for ch in 0..C {
+                    d_in[[nr, nc, ch]] +=
+                        d_perc[[idx, C + ch]] * wx + d_perc[[idx, 2 * C + ch]] * wy;
                 }
             }
         }

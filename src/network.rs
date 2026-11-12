@@ -74,28 +74,14 @@ impl NCANet {
         }
     }
 
-    // Returns (pre_relu, delta); pre_relu is cached for backward.
-    pub fn forward(&self, p: &[f32; PERC]) -> ([f32; HIDDEN], [f32; C]) {
-        let mut pre = [0.0f32; HIDDEN];
-        for i in 0..HIDDEN {
-            let mut acc = self.b1[i];
-            let row = self.w1.row(i);
-            for j in 0..PERC {
-                acc += row[j] * p[j];
-            }
-            pre[i] = acc;
-        }
-        let mut delta = [0.0f32; C];
-        for k in 0..C {
-            let mut acc = self.b2[k];
-            let row = self.w2.row(k);
-            for i in 0..HIDDEN {
-                let h = if pre[i] > 0.0 { pre[i] } else { 0.0 }; // ReLU
-                acc += row[i] * h;
-            }
-            delta[k] = acc;
-        }
-        (pre, delta)
+    // All cells at once: `p` is [N, PERC], one row per cell. Returns
+    // (hidden [N, HIDDEN], delta [N, C]); hidden is the post-ReLU activation,
+    // cached for backward (hidden > 0 <=> the ReLU passed gradient).
+    pub fn forward_batch(&self, p: &Array2<f32>) -> (Array2<f32>, Array2<f32>) {
+        let mut hidden = p.dot(&self.w1.t()) + &self.b1;
+        hidden.mapv_inplace(|x| if x > 0.0 { x } else { 0.0 }); // ReLU
+        let delta = hidden.dot(&self.w2.t()) + &self.b2;
+        (hidden, delta)
     }
 
     pub fn add_scaled(&mut self, g: &Grads, scale: f32) {

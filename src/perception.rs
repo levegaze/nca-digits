@@ -3,6 +3,7 @@
 
 use crate::constants::*;
 use crate::grid::Grid;
+use ndarray::Array2;
 
 // Sobel kernels scaled by 1/8 (the Growing-CA convention).
 pub const SOBEL_X: [[f32; 3]; 3] = [
@@ -15,6 +16,21 @@ pub const SOBEL_Y: [[f32; 3]; 3] = [
     [0.0, 0.0, 0.0],
     [1.0 / 8.0, 2.0 / 8.0, 1.0 / 8.0],
 ];
+
+// Perception of every cell as one [H*W, PERC] matrix (row = r * W + c), the
+// input to NCANet::forward_batch.
+pub fn perceive_all(g: &Grid) -> Array2<f32> {
+    let mut p = Array2::zeros((H * W, PERC));
+    for r in 0..H {
+        for c in 0..W {
+            let v = perceive(g, r, c);
+            for (dst, src) in p.row_mut(r * W + c).iter_mut().zip(v) {
+                *dst = src;
+            }
+        }
+    }
+    p
+}
 
 // perception layout: [0..C] = self, [C..2C] = d/dx, [2C..3C] = d/dy.
 pub fn perceive(g: &Grid, r: usize, c: usize) -> [f32; PERC] {
